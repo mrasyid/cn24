@@ -56,6 +56,10 @@ public:
     return data_input_json_;
   }
 
+  JSON GetYOLOConfiguration() {
+    return net_json_["yolo_configuration"];
+  }
+
   bool AddLayers(NetGraph& graph, ClassManager* class_manager, unsigned int seed = 0);
 
 private:
