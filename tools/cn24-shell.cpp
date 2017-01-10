@@ -61,6 +61,8 @@ int stat_id_correct_pred;
 int stat_id_correct_loc;
 int stat_id_wrong_pred;
 
+Conv::JSON global_yolo_config = Conv::JSON::object();
+
 int main (int argc, char* argv[]) {
   bool FROM_SCRIPT = false;
   int requested_log_level = -1;
@@ -176,6 +178,7 @@ int main (int argc, char* argv[]) {
   if(factory->GetHyperparameters().count("batch_size_parallel") == 1 && factory->GetHyperparameters()["batch_size_parallel"].is_number()) {
     batch_size_parallel = factory->GetHyperparameters()["batch_size_parallel"];
   }
+  global_yolo_config = factory->GetYOLOConfiguration();
 
   Conv::ClassManager class_manager;
 
@@ -489,15 +492,49 @@ bool parseCommand (Conv::ClassManager& class_manager, Conv::SegmentSetInputLayer
       }
     } else if(set_command.compare(0, 5, "score") == 0) {
       std::string source_set_name;
+      std::string policy_str = "default";
       Conv::ParseStringParamIfPossible(set_command, "name", source_set_name);
+      Conv::ParseStringParamIfPossible(set_command, "policy", policy_str);
       Conv::SegmentSet *source_set = findSegmentSet(input_layer, source_set_name);
 
       if(source_set == nullptr) {
         LOGWARN << "Could not find SegmentSet \"" << source_set_name << "\"";
       } else {
+        Conv::ActiveLearningPolicy* policy = nullptr;
+        if(policy_str.compare("default") == 0) {
+          policy = new Conv::DefaultActiveLearningPolicy();
+        } else if(policy_str.compare("yolo_wholeimage") == 0) {
+          policy = new Conv::YOLOWholeImageActiveLearningPolicy(global_yolo_config);
+        } else {
+          LOGERROR << "Unknown policy \"" << policy << "\"";
+          return true;
+        }
+
+
+        Conv::NetGraphBuffer& prediction_buffer = graph.GetOutputNodes()[0]->output_buffers[0];
+        Conv::DatasetMetadataPointer* predicted_metadata = prediction_buffer.combined_tensor->metadata;
+        unsigned int batch_size = prediction_buffer.combined_tensor->data.samples();
+
         for(unsigned int s = 0; s < source_set->GetSegmentCount(); s++) {
           Conv::Segment* segment = source_set->GetSegment(s);
-          segment->score = 1;
+
+          Conv::datum segment_score = 0;
+          for(unsigned int sample = 0; sample < segment->GetSampleCount(); sample += batch_size) {
+            // Inner loop to exploit sample level parallelism
+            for (unsigned int bindex = 0;
+                 bindex < batch_size && (sample + bindex) < segment->GetSampleCount(); bindex++) {
+              Conv::JSON &sample_json = segment->GetSample(sample + bindex);
+              input_layer->ForceLoadDetection(sample_json, bindex);
+            }
+            graph.FeedForward();
+            for (unsigned int bindex = 0;
+                 bindex < batch_size && (sample + bindex) < segment->GetSampleCount(); bindex++) {
+              segment_score += policy->Score(prediction_buffer.combined_tensor->data, predicted_metadata, bindex);
+              std::cout << "." << std::flush;
+            }
+          }
+
+          segment->score = segment_score;
         }
         LOGINFO << "Finished scoring SegmentSet \"" << source_set->name << "\"";
       }
